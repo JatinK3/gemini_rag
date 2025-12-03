@@ -1,3 +1,4 @@
+# app.py
 import os
 import time
 import tempfile
@@ -1616,6 +1617,94 @@ with chat_tab:
                         st.info("PDF export unavailable (reportlab not installed or failed). Install it with `pip install reportlab` to enable PDF export.")
                         # Optionally show debug info in dev mode:
                         # st.write(str(pdf_e))
+
+
+                st.markdown(r"""
+                            <script>
+                            (function(){
+                            const id = "answer-section";
+                            const headerOffset = 48; // tweak up if you have a tall sticky header
+
+                            function findScrollableAncestor(el) {
+                                let node = el.parentElement;
+                                while (node && node !== document.body && node !== document.documentElement) {
+                                const s = window.getComputedStyle(node);
+                                const ow = s.getPropertyValue('overflow-y');
+                                if ((ow === 'auto' || ow === 'scroll') && node.scrollHeight > node.clientHeight) return node;
+                                node = node.parentElement;
+                                }
+                                return window;
+                            }
+
+                            function scrollAncestorToEl(ancestor, el) {
+                                try {
+                                if (ancestor === window) {
+                                    // center the element in viewport while accounting for header offset
+                                    const rect = el.getBoundingClientRect();
+                                    const absoluteTop = rect.top + window.pageYOffset;
+                                    const target = Math.max(0, absoluteTop - headerOffset - (window.innerHeight/2) + (rect.height/2));
+                                    window.scrollTo({ top: target, behavior: 'smooth' });
+                                    console.log('scroll-to-answer -> window', { absoluteTop, target, headerOffset });
+                                } else {
+                                    const ancRect = ancestor.getBoundingClientRect();
+                                    const elRect = el.getBoundingClientRect();
+                                    const offsetWithin = (elRect.top - ancRect.top) + ancestor.scrollTop;
+                                    const target = Math.max(0, offsetWithin - headerOffset - (ancestor.clientHeight/2) + (elRect.height/2));
+                                    ancestor.scrollTo({ top: target, behavior: 'smooth' });
+                                    console.log('scroll-to-answer -> ancestor', { offsetWithin, target, headerOffset, ancestor });
+                                }
+                                return true;
+                                } catch(e) {
+                                console.error('scroll-to-answer error', e);
+                                return false;
+                                }
+                            }
+
+                            function tryScroll() {
+                                const el = document.getElementById(id);
+                                if (!el) {
+                                console.log('scroll-to-answer: element not found yet');
+                                return false;
+                                }
+                                const ancestor = findScrollableAncestor(el);
+                                return scrollAncestorToEl(ancestor, el);
+                            }
+
+                            // immediate try (in case element already exists)
+                            if (tryScroll()) {
+                                console.log('scroll-to-answer: scrolled immediately');
+                                return;
+                            }
+
+                            // MutationObserver watch
+                            const mo = new MutationObserver((mutations, obs) => {
+                                const el = document.getElementById(id);
+                                if (el) {
+                                console.log('scroll-to-answer: element detected by MutationObserver');
+                                tryScroll();
+                                obs.disconnect();
+                                }
+                            });
+                            mo.observe(document.body, { childList: true, subtree: true });
+
+                            // Fallback periodic check
+                            let attempts = 0;
+                            const maxAttempts = 20;
+                            const iv = setInterval(() => {
+                                attempts += 1;
+                                if (tryScroll()) {
+                                console.log('scroll-to-answer: scrolled via interval check', attempts);
+                                clearInterval(iv);
+                                try{ mo.disconnect(); } catch(e){}
+                                } else if (attempts >= maxAttempts) {
+                                console.log('scroll-to-answer: gave up after', attempts);
+                                clearInterval(iv);
+                                try{ mo.disconnect(); } catch(e){}
+                                }
+                            }, 250);
+                            })();
+                            </script>
+                            """, unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Request failed: {e}")
 # ---------- end Ask (RAG) ----------
