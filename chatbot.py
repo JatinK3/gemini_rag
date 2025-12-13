@@ -1,15 +1,10 @@
-"""
-Echo-style chat UI that uses your helper functions and calls google.genai when available.
-Run:
-    streamlit run app.py
-"""
-
 import os
 import re
 import io
 import time
 import tempfile
 import logging
+from itertools import chain
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +24,8 @@ except Exception:
 
 # Load .env if present (optional)
 load_dotenv(override=False)
+if "gemini_api_key" not in st.session_state:
+    st.session_state["gemini_api_key"] = os.environ.get("GEMINI_API_KEY", "")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("echo_rag_chat")
@@ -43,31 +40,58 @@ def _store_session_key_for(store):
         or "none"
     )
 
+def _render_with_cursor(text: str) -> str:
+    # Blink every ~500ms
+    blink_on = int(time.time() * 2) % 2 == 0
+    return text + (" " if blink_on else "")
 
-# def _safe_to_plain(o: Any) -> Any:
-#     if o is None:
-#         return None
-#     if isinstance(o, (str, int, float, bool)):
-#         return o
-#     if isinstance(o, dict):
-#         return {k: _safe_to_plain(v) for k, v in o.items()}
-#     if isinstance(o, (list, tuple)):
-#         return [_safe_to_plain(x) for x in o]
-#     for fn in ("model_dump", "to_dict", "as_dict"):
-#         if hasattr(o, fn):
-#             try:
-#                 return _safe_to_plain(getattr(o, fn)())
-#             except Exception:
-#                 continue
-#     if hasattr(o, "__dict__"):
-#         try:
-#             return _safe_to_plain(vars(o))
-#         except Exception:
-#             pass
-#     try:
-#         return str(o)
-#     except Exception:
-#         return repr(o)
+def _looks_like_structured_output(text: str) -> bool:
+    """
+    Detects JSON or Markdown table intent.
+    Streaming tables/JSON should NOT be rendered mid-stream.
+    """
+    stripped = text.lstrip()
+    return (
+        stripped.startswith("{")
+        or stripped.startswith("[")
+        or ("|" in stripped and "\n|" in stripped)
+    )
+def handle_streaming_error(e, model_choice):
+    info = classify_gemini_error(e)
+    st.session_state["_last_gemini_error_handled"] = True
+
+    if info["type"] == "quota":
+        st.error(
+            "🚫 **Gemini free-tier quota reached**\n\n"
+            f"- Model: `{info['model'] or model_choice}`\n"
+            "Please wait for quota reset or upgrade your plan."
+        )
+    elif info["type"] == "rate":
+        st.warning("⚠️ **Rate limit hit** — please retry shortly.")
+    elif info["type"] == "auth":
+        st.error("🔑 **API key issue** — check your key.")
+    else:
+        st.error(f"Request failed: {e}")
+
+    st.stop()
+
+def animate_thinking(placeholder, label="Thinking", duration=1.2, interval=0.3):
+    start = time.time()
+    dots = 0
+
+    while time.time() - start < duration:
+        dots = (dots % 3) + 1
+        placeholder.markdown(f"_{label}{'.' * dots}_")
+        time.sleep(interval)
+
+    return start
+def fade_out_text(placeholder, text):
+    for suffix in ["", ".", ""]:
+        placeholder.markdown(f"_{text}{suffix}_")
+        time.sleep(0.15)
+    placeholder.empty()
+
+
 def _safe_to_plain(o: Any) -> Any:
     if o is None:
         return None
@@ -149,6 +173,60 @@ def pretty_doc_name(raw_name: Optional[str]) -> str:
     if len(name) <= 60:
         name = name.title()
     return name
+
+def _looks_like_structured_output(text: str) -> bool:
+    return any([
+        "\n|" in text,               # Markdown table
+        text.strip().startswith("{"), # JSON
+        text.strip().startswith("["), # JSON array
+        "```" in text                # Code block
+    ])
+def classify_gemini_error(err: Exception) -> dict:
+    """
+    Returns structured info about Gemini errors.
+    """
+    msg = str(err)
+    lower = msg.lower()
+
+    result = {
+        "type": None,            # quota | rate | auth | unknown
+        "tier": None,            # free | paid | unknown
+        "retryable": False,
+        "model": None,
+        "raw": msg,
+    }
+
+    # --- RESOURCE_EXHAUSTED / QUOTA ---
+    if "resource_exhausted" in lower or "quota exceeded" in lower:
+        result["type"] = "quota"
+
+        # Detect free tier explicitly
+        if "free_tier" in lower:
+            result["tier"] = "free"
+
+        # Extract model if present
+        for m in ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-1.0"]:
+            if m in lower:
+                result["model"] = m
+
+        # Retry info
+        result["retryable"] = "retry in" in lower and "limit: 0" not in lower
+        return result
+
+    # --- RATE LIMIT (429 but not quota exhausted) ---
+    if "429" in lower or "too many requests" in lower:
+        result["type"] = "rate"
+        result["retryable"] = True
+        return result
+
+    # --- AUTH / API KEY ---
+    if any(k in lower for k in ["api key", "permission", "unauthorized"]):
+        result["type"] = "auth"
+        return result
+
+    result["type"] = "unknown"
+    return result
+
 
 def _normalize_chunk(ch, resp_for_lookup=None):
     if not ch:
@@ -353,7 +431,7 @@ def sanitize_filename(filename: str) -> str:
 #         except Exception as e2:
 #             raise RuntimeError(f"Failed to save upload: {e} / fallback: {e2}")
 
-#     return tmp_path
+#     return tmp_pathc
 
 def safe_write_tmp(uploaded_file, original_name: str) -> str:
     """
@@ -616,35 +694,89 @@ def list_stores_via_sdk(client):
 # ---------------------
 
 st.set_page_config(page_title="FILE SEARCH RAG", layout="wide")
-st.title("FILE SEARCH RAG")
+st.markdown(
+    """
+    <h1 style="text-align:center;">FILE SEARCH RAG</h1>
+    <hr style="margin-top: 0.5rem; margin-bottom: 1rem;">
+    """,
+    unsafe_allow_html=True
+)
+# st.title("FILE SEARCH RAG")
 
 # initialize client if possible
 client = None
-if GENAI_AVAILABLE:
+
+if GENAI_AVAILABLE and st.session_state.get("gemini_api_key"):
     try:
-        client = genai.Client()
+        # Recreate client only if key changed or client missing
+        if st.session_state.get("_client_needs_refresh") or "genai_client" not in st.session_state:
+            st.session_state["genai_client"] = genai.Client()
+            st.session_state["_client_needs_refresh"] = False
+
+        client = st.session_state["genai_client"]
+
     except Exception as e:
         client = None
-        st.sidebar.error(f"genai init failed: {e}")
+        st.sidebar.error(f"Gemini client initialization failed: {e}")
 else:
-    st.sidebar.info("google-genai client not installed — running in echo/fallback mode.")
+    st.sidebar.info("Set GEMINI_API_KEY to enable Gemini features.")
+if st.session_state["gemini_api_key"]:
+    st.sidebar.success("Gemini API key loaded")
+else:
+    st.sidebar.warning("No Gemini API key set")
 
 # Sidebar: minimal model / api controls (optional) + upload UI moved here
 
 
 with st.sidebar:
+    st.markdown("### Usage / Quota")
+    if st.session_state.get("_quota_warning"):
+        st.warning(st.session_state["_quota_warning"])
+    else:
+        st.caption(
+            "Free Gemini tier has strict request limits. "
+            "If you hit limits, wait a bit or upgrade your API plan."
+            )
+    st.markdown("---")
     st.header("Model / API")
     model_choice = st.selectbox("Model", ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.0"], index=0)
     max_output_tokens = st.number_input("Max output tokens", min_value=64, max_value=2000, value=1000, step=64)
-    api_key_input = st.text_input("GEMINI_API_KEY (or set env var)", value=os.environ.get("GEMINI_API_KEY", ""), type="password")
-    if api_key_input:
+    api_key_input = st.text_input(
+            "GEMINI_API_KEY",
+            value=st.session_state["gemini_api_key"],
+            type="password",
+            help="Loaded from environment by default. You can override it here."
+        )
+    apply_key = st.button("Apply API Key", type="primary")
+    if apply_key or api_key_input != st.session_state["gemini_api_key"]:
+        new_key = api_key_input.strip()
+
+        if new_key:
+            # Persist key
+            st.session_state["gemini_api_key"] = new_key
+            os.environ["GEMINI_API_KEY"] = new_key
+
+            # Force client + store refresh
+            st.session_state["_client_needs_refresh"] = True
+            st.session_state.pop("genai_client", None)
+            st.session_state.pop("filestores_cached", None)
+
+            # Clear selected store (API-key scoped)
+            st.session_state.pop("selected_filestore_index", None)
+
+            st.success("✅ API key applied. Reloading stores…")
+            st.rerun()
+
+    if api_key_input != st.session_state["gemini_api_key"]:
+        st.session_state["gemini_api_key"] = api_key_input.strip()
         os.environ["GEMINI_API_KEY"] = api_key_input.strip()
+        st.session_state["_client_needs_refresh"] = True
 
-    st.markdown("---")
-    st.subheader("File store / Upload")
+        st.markdown("---")
+        st.subheader("File store / Upload")
 
-    if client is None:
-        st.info("genai client not initialized — file upload disabled.")
+        if client is None:
+            st.info("genai client not initialized — file upload disabled.")
     else:
         # Create new store
         new_store_name = st.text_input("New store display name (optional)", key="sidebar_new_store_name")
@@ -655,8 +787,10 @@ with st.sidebar:
                 st.session_state.pop("filestores_cached", None)
             except Exception as e:
                 st.error(f"Create failed: {e}")
+        
 
         st.markdown("---")
+
         st.caption("Upload & import file into a File Search store")
         wait_for_import = st.checkbox("Wait for import to finish (may take time)", value=False, key="wait_for_import")
         # optional: allow max polling timeout when waiting
@@ -759,8 +893,10 @@ with st.sidebar:
 
         upload_file = st.file_uploader("Choose a file (PDF, DOCX, TXT, etc.)", accept_multiple_files=False, key="sidebar_files_uploader")
         display_name = st.text_input("Display name for the file (optional)", key="sidebar_files_display_name")
-        chunk_tokens = st.number_input("Max tokens per chunk (0 to disable)", min_value=0, max_value=2000, value=0, step=50, key="sidebar_chunk_tokens")
-        chunk_overlap = st.number_input("Max overlap tokens", min_value=0, max_value=1000, value=0, step=10, key="sidebar_chunk_overlap")
+        # chunk_tokens = st.number_input("Max tokens per chunk (0 to disable)", min_value=0, max_value=2000, value=0, step=50, key="sidebar_chunk_tokens")
+        # chunk_overlap = st.number_input("Max overlap tokens", min_value=0, max_value=1000, value=0, step=10, key="sidebar_chunk_overlap")
+        chunk_tokens = 0
+        chunk_overlap = 0
 
         if st.button("Import file into selected store", key="sidebar_files_import_btn"):
             if upload_file is None:
@@ -1014,6 +1150,7 @@ if prompt:
                 - Provide a short summary (2–3 sentences) first.
                 - Then provide step-by-step explanation or runnable code if relevant.
                 - Use code fences and specify language for code blocks.
+                - If producing JSON or a table, generate the full structure before emitting content.
 
                 4. Fallback rule:
                 - If the documents do NOT contain the needed information, and you are NOT allowed to use general knowledge, respond exactly with: "I cannot answer from the provided documents."
@@ -1066,7 +1203,41 @@ if prompt:
                     cfg = types.GenerateContentConfig(max_output_tokens=int(max_output_tokens), tools=tools_list)
                 else:
                     cfg = types.GenerateContentConfig(max_output_tokens=int(max_output_tokens))
-                resp = client.models.generate_content(model=model_choice, contents=contents, config=cfg)
+                # resp = client.models.generate_content(model=model_choice, contents=contents, config=cfg)
+                try:
+                    stream = client.models.generate_content_stream(
+                        model=model_choice,
+                        contents=contents,
+                        config=cfg
+                    )
+
+                except Exception as e:
+                    info = classify_gemini_error(e)
+
+                    st.session_state["_last_gemini_error_handled"] = True
+
+                    if info["type"] == "quota" and info["tier"] == "free":
+                        st.error(
+                            "🚫 **Free tier quota exhausted**\n\n"
+                            f"- Model: `{info['model'] or model_choice}`\n"
+                            "- You have hit the free-tier request limit.\n\n"
+                            "Try again after reset or upgrade your plan."
+                        )
+
+                    elif info["type"] == "rate":
+                        st.warning(
+                            f"⚠️ **Rate limit hit** — retry in a few seconds."
+                        )
+
+                    elif info["type"] == "auth":
+                        st.error(
+                            "🔑 **API key issue** — please update your key."
+                        )
+
+                    else:
+                        st.error(f"Request failed: {e}")
+
+                    st.stop()
             else:
                 # Fallback: echoing to simulate a response object shape as minimally as possible
                 class DummyResp:
@@ -1074,33 +1245,224 @@ if prompt:
                 resp = DummyResp()
 
             # extract answer text using provided helper
-            answer_text = extract_text(resp) or "(no answer returned)"
+            # answer_text = extract_text(resp) or "(no answer returned)"
 
-            # show assistant message
+            # # show assistant message
+            # with st.chat_message("assistant"):
+            #     st.write(answer_text)
+            #     # print(answer_text)
+            # st.session_state["messages"].append({"role": "assistant", "content": answer_text})
+
+            # # For debugging: store the raw response (plainified) for inspection
+            # try:
+            #     raw_inspect = getattr(resp, "_raw", None) or getattr(resp, "raw", None)
+            #     st.session_state["_last_resp_raw"] = _safe_to_plain(raw_inspect)
+            # except Exception:
+            #     st.session_state["_last_resp_raw"] = None
+
+            # # try to extract grounding snippets (may be empty)
+            # snips = get_top_grounding_snippets(resp, top_n=5)
+
+            # --- STREAMING RESPONSE HANDLING ---
+            full_text = ""
+            final_chunk = None
+            TYPE_DELAY_SEC = 0.02
+
+            def response_generator(stream, delay=TYPE_DELAY_SEC):
+                for chunk in stream:
+                    delta = getattr(chunk, "text", None)
+                    if not delta:
+                        continue
+                    for word in delta.split(" "):
+                        yield word + " "
+                        time.sleep(delay)
+
+            # with st.chat_message("assistant"):
+            #     placeholder = st.empty()
+            #     placeholder.markdown("_Thinking… retrieving documents..._")
+            #     full_text = ""
+            #     buffered_chunks = []
+            #     structured = False
+            # try:
+            #     # 1️⃣ Peek a small prefix to decide mode
+            #     for chunk in stream:
+            #         buffered_chunks.append(chunk)
+            #         delta = getattr(chunk, "text", None)
+            #         if delta:
+            #             full_text += delta
+            #         if len(full_text) > 300:  # enough to detect structure
+            #             break
+
+            #     structured = _looks_like_structured_output(full_text)
+
+            #     # 2️⃣ PLAIN TEXT → st.write_stream + sleep
+            #     if not structured:
+            #         response_text = st.write_stream(
+            #             response_generator(
+            #                 iter(buffered_chunks + list(stream))
+            #             )
+            #         )
+            #         full_text = response_text
+
+            #     # 3️⃣ STRUCTURED OUTPUT → safe renderer
+            #     else:
+            #         placeholder.markdown("_Formatting structured output…_")
+            #         full_text = ""
+
+            #         for chunk in buffered_chunks + list(stream):
+            #             delta = getattr(chunk, "text", None)
+            #             if not delta:
+            #                 continue
+            #             full_text += delta
+            #             placeholder.markdown(full_text)
+
+            #         placeholder.markdown(full_text)
+
+            # except Exception as e:
+            #     handle_streaming_error(e, model_choice)
+
+            # with st.chat_message("assistant"):
+            #     placeholder = st.empty()
+            #     uses_file_search = bool(tools_list)
+
+            #     # --- THINKING PHASE ---
+            #     thinking_label = "Retrieving documents" if uses_file_search else "Thinking"
+            #     think_start = time.time()
+            #     placeholder.markdown(f"_{thinking_label}…_")
+            #     full_text = ""
+            #     buffered_chunks = []
+            #     structured = False
+                
+
+            #     try:
+                    
+            #         # 1️⃣ Peek a small prefix to decide mode
+            #         for chunk in stream:
+            #             buffered_chunks.append(chunk)
+            #             delta = getattr(chunk, "text", None)
+            #             if delta:
+            #                 full_text += delta
+            #             if len(full_text) > 300:
+            #                 break
+
+            #         structured = _looks_like_structured_output(full_text)
+
+            #         # 2️⃣ PLAIN TEXT → st.write_stream + sleep
+            #         if not structured:
+            #             response_text = st.write_stream(
+            #                 response_generator(
+            #                     iter(buffered_chunks + list(stream))
+            #                 )
+            #             )
+            #             full_text = response_text
+
+            #         # 3️⃣ STRUCTURED OUTPUT → safe renderer
+            #         else:
+            #             placeholder.markdown("_Formatting structured output…_")
+            #             full_text = ""
+
+            #             for chunk in buffered_chunks + list(stream):
+            #                 delta = getattr(chunk, "text", None)
+            #                 if delta:
+            #                     full_text += delta
+            #                     placeholder.markdown(full_text)
+
+            #             placeholder.markdown(full_text)
+                    
+            #         thinking_time = time.time() - think_start
+            #         st.caption(f"💭 Thought for {thinking_time:.1f}s")
+
+            #     except Exception as e:
+            #         handle_streaming_error(e, model_choice)
+
             with st.chat_message("assistant"):
-                st.write(answer_text)
-                # print(answer_text)
-            st.session_state["messages"].append({"role": "assistant", "content": answer_text})
+                placeholder = st.empty()
+                uses_file_search = bool(tools_list)
 
-            # For debugging: store the raw response (plainified) for inspection
+                thinking_label = "Retrieving documents" if uses_file_search else "Thinking"
+                think_start = time.time()
+                placeholder.markdown(f"_{thinking_label}…_")
+
+                full_text = ""
+                buffered_chunks = []
+                structured = False
+
+                try:
+                    # Peek
+                    for chunk in stream:
+                        buffered_chunks.append(chunk)
+                        delta = getattr(chunk, "text", None)
+                        if delta:
+                            full_text += delta
+                        if len(full_text) > 120:  # ✅ reduced
+                            break
+
+                    structured = _looks_like_structured_output(full_text)
+
+                    # PLAIN TEXT
+                    if not structured:
+                        response_text = st.write_stream(
+                            response_generator(
+                                chain(buffered_chunks, stream)  # ✅ no blocking
+                            )
+                        )
+                        full_text = response_text
+
+                    # STRUCTURED
+                    else:
+                        placeholder.markdown("_Formatting structured output…_")
+                        full_text = ""
+
+                        for chunk in chain(buffered_chunks, stream):
+                            delta = getattr(chunk, "text", None)
+                            if delta:
+                                full_text += delta
+                                placeholder.markdown(full_text)
+
+                        placeholder.markdown(full_text)
+
+                    thinking_time = time.time() - think_start
+                    st.caption(f"💭 Thought for {thinking_time:.1f}s")
+
+                except Exception as e:
+                    handle_streaming_error(e, model_choice)
+
+            # persist message
+            st.session_state["messages"].append({
+                "role": "assistant",
+                "content": full_text or "(no answer returned)"
+            })
+
+            # store raw response for debugging (best-effort)
             try:
-                raw_inspect = getattr(resp, "_raw", None) or getattr(resp, "raw", None)
+                raw_inspect = getattr(final_chunk, "_raw", None) or getattr(final_chunk, "raw", None)
                 st.session_state["_last_resp_raw"] = _safe_to_plain(raw_inspect)
             except Exception:
                 st.session_state["_last_resp_raw"] = None
 
-            # try to extract grounding snippets (may be empty)
-            snips = get_top_grounding_snippets(resp, top_n=5)
-            if snips:
-                sources_summary = "Sources: " + ", ".join(pretty_doc_name(s.get("doc") or "Unknown") for s in snips)
-            else:
-                # If no grounding snippets and you passed a store, it's useful to inform the user
-                if selected_store is not None:
-                        st.info("_No grounding snippets were found in the model response. The model may have used general knowledge or the store contained no relevant content._")
+            # extract grounding snippets AFTER streaming completes
+            snips = []
+            try:
+                if hasattr(stream, "response"):
+                    snips = get_top_grounding_snippets(stream.response, top_n=5)
+            except Exception:
+                pass
+            if not snips and selected_store is not None:
+                # st.info(
+                #     "_No grounding snippets were found. "
+                #     "This may indicate that the retrieved documents did not contain relevant information._"
+                # )
+                pass
 
         except Exception as e:
-            # show error to user
+            # Do NOT append Gemini quota/rate errors to chat
+            if st.session_state.pop("_last_gemini_error_handled", False):
+                st.stop()
+
             with st.chat_message("assistant"):
                 st.markdown(f"Request failed: {e}")
-            st.session_state["messages"].append({"role": "assistant", "content": f"Request failed: {e}"})
 
+            st.session_state["messages"].append({
+                "role": "assistant",
+                "content": f"Request failed: {e}"
+            })
